@@ -2,10 +2,16 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>3D ASCII Wildflower Bouquet</title>
     <style>
-        /* Reset and full-screen dark charcoal-slate terminal canvas */
+        /* Reset and full-screen mobile-first terminal canvas */
+        :root {
+            --sat: env(safe-area-inset-top, 0px);
+            --sar: env(safe-area-inset-right, 0px);
+            --sab: env(safe-area-inset-bottom, 0px);
+            --sal: env(safe-area-inset-left, 0px);
+        }
         * {
             margin: 0;
             padding: 0;
@@ -14,8 +20,11 @@
         html, body {
             width: 100%;
             height: 100%;
-            background-color: #1a1e26;
+            min-height: 100svh;
+            min-height: 100dvh;
+            background-color: #181c24;
             overflow: hidden;
+            overscroll-behavior: none;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -24,8 +33,11 @@
             display: block;
             width: 100vw;
             height: 100vh;
+            height: 100svh;
+            height: 100dvh;
             cursor: pointer;
             user-select: none;
+            -webkit-user-select: none;
             -webkit-tap-highlight-color: transparent;
             touch-action: manipulation;
         }
@@ -39,7 +51,7 @@
             const canvas = document.getElementById('asciiCanvas');
             const ctx = canvas.getContext('2d', { alpha: false });
 
-            // Deterministic pseudo-random generator for consistent bouquet architecture
+            // Deterministic pseudo-random generator for reproducible botanical geometry
             let seed = 8842;
             function rand() {
                 seed = (seed * 1664525 + 1013904223) % 4294967296;
@@ -49,32 +61,42 @@
                 return min + rand() * (max - min);
             }
 
-            // Grid & Z-Buffer state
+            // Viewport & safe-area metrics
+            let viewW = 390;
+            let viewH = 844;
+            let safeTop = 0;
+            let safeBottom = 0;
+            let safeLeft = 0;
+            let safeRight = 0;
+
+            // High-density monospace ASCII grid & Z-buffer state
             let cols = 0;
             let rows = 0;
-            let cellW = 7;
-            let cellH = 12;
+            let cellW = 5;
+            let cellH = 8;
             let zBuffer = new Float32Array(0);
             let charBuffer = [];
             let colorBuffer = [];
             let glowBuffer = new Uint8Array(0);
+            let cachedBgGrad = null;
 
             // Color palettes matching the terminal wildflower aesthetic
             const STEM_PALETTE = [
-                '#6f947c', '#7fa68a', '#8eb899', '#5d806a', '#9fc4a8', '#a8cfb2'
+                '#648a73', '#759e83', '#88b395', '#557863', '#9ac2a4', '#add4b7'
             ];
 
             const FLOWER_THEMES = [
-                { name: 'coral',      inner: ['#ffd166', '#ffb703', '#ffffff'], outer: ['#ff6b81', '#ff758f', '#ff8fa3'], accent: '#ffc2d1' },
+                { name: 'coral',      inner: ['#ffd166', '#ffb703', '#ffffff'], outer: ['#ff5d78', '#ff758f', '#ff8fa3'], accent: '#ffc2d1' },
                 { name: 'amber',      inner: ['#ffffff', '#fff3b0', '#ff9f1c'], outer: ['#feca57', '#ffbe0b', '#ffd166'], accent: '#ffeaa7' },
                 { name: 'periwinkle', inner: ['#ffffff', '#fef08a', '#bae6fd'], outer: ['#54a0ff', '#60a5fa', '#3b82f6'], accent: '#bfdbfe' },
                 { name: 'lavender',   inner: ['#fef08a', '#ffffff', '#f5d0fe'], outer: ['#a29bfe', '#c084fc', '#b794f4'], accent: '#e9d5ff' },
                 { name: 'cream',      inner: ['#feca57', '#ff9f43', '#ff6b81'], outer: ['#f5f6fa', '#e2e8f0', '#fef9c3'], accent: '#ffffff' }
             ];
 
-            // 3D point cloud structures for stems, foliage, and flower heads
+            // 3D point cloud structures and dynamic bounding box
             const bouquetPoints = [];
             const ambientParticles = [];
+            let bounds = { minY: -1.12, maxY: 1.15, maxRadiusXZ: 1.05 };
 
             // Flower arrangement cycling state (0: Wildflowers, 1: Sunflowers, 2: Tulips, 3: Mixed Garden)
             const FLOWER_MODES = ['wildflowers', 'sunflowers', 'tulips', 'mixed'];
@@ -85,10 +107,28 @@
                 'a handpicked garden made to last forever'
             ];
             let currentModeIndex = 0;
-            let transitionProgress = 1; // 0 -> 1 smooth bloom/morph transition on click
+            let transitionProgress = 1;
             let lastTime = 0;
             let spinAngle = 0;
             let lastSwitchTimestamp = 0;
+            let activePointerId = null;
+            let pointerDownX = 0;
+            let pointerDownY = 0;
+
+            /**
+             * Measure CSS safe-area insets accurately on notched iOS/Android devices
+             */
+            function readSafeAreaInsets() {
+                const probe = document.createElement('div');
+                probe.style.cssText = 'position:fixed;top:env(safe-area-inset-top,0px);right:env(safe-area-inset-right,0px);bottom:env(safe-area-inset-bottom,0px);left:env(safe-area-inset-left,0px);pointer-events:none;visibility:hidden;';
+                document.body.appendChild(probe);
+                const rect = probe.getBoundingClientRect();
+                safeTop = Math.max(0, rect.top);
+                safeLeft = Math.max(0, rect.left);
+                safeRight = Math.max(0, window.innerWidth - rect.right);
+                safeBottom = Math.max(0, window.innerHeight - rect.bottom);
+                document.body.removeChild(probe);
+            }
 
             /**
              * Helper: Oriented 3D local transform for flower heads
@@ -112,17 +152,47 @@
             }
 
             /**
-             * Helper: Adds a multi-layered wildflower bloom at (fx, fy, fz)
+             * Helper: Adds a green calyx / sepal base cup underneath a flower head
+             */
+            function addCalyxCup(transformLocal, radius, height) {
+                const sepalCount = 6;
+                for (let s = 0; s < sepalCount; s++) {
+                    const a = (s / sepalCount) * Math.PI * 2;
+                    for (let rStep = 1; rStep <= 4; rStep++) {
+                        const rf = rStep / 4;
+                        const r = radius * rf;
+                        const ly = -height * (1 - rf * 0.65);
+                        const pos = transformLocal(Math.cos(a) * r, ly, Math.sin(a) * r);
+                        bouquetPoints.push({
+                            x: pos.x,
+                            y: pos.y,
+                            z: pos.z,
+                            color: rStep > 2 ? '#88b395' : '#557863',
+                            type: 'leaf',
+                            customChar: rStep === 4 ? '^' : '#',
+                            phase: rand() * Math.PI * 2,
+                            glow: 0.25
+                        });
+                    }
+                }
+            }
+
+            /**
+             * Helper: Adds an ultra-detailed, multi-tiered wildflower bloom at (fx, fy, fz)
              */
             function addWildflowerHead(fx, fy, fz, theme, scale, tiltX, tiltZ) {
-                const bloomRadius = 0.135 * scale;
+                const bloomRadius = 0.165 * scale;
                 const transformLocal = createTransform(fx, fy, fz, tiltX, tiltZ);
 
-                const coreChars = ['@', '0', 'O', 'o', '*', '+'];
-                for (let c = 0; c < 18; c++) {
-                    const r = Math.sqrt(rand()) * bloomRadius * 0.34;
-                    const a = rand() * Math.PI * 2;
-                    const h = (1 - r / (bloomRadius * 0.36)) * 0.035;
+                addCalyxCup(transformLocal, bloomRadius * 0.45, 0.04 * scale);
+
+                // Dense central stamen & pollen cluster
+                const coreChars = ['@', '#', '0', 'O', 'o', '*', '+'];
+                for (let c = 0; c < 30; c++) {
+                    const frac = c / 30;
+                    const r = Math.sqrt(frac) * bloomRadius * 0.36;
+                    const a = c * 2.39996323;
+                    const h = (1 - frac * 0.7) * 0.048 * scale;
                     const pos = transformLocal(Math.cos(a) * r, h, Math.sin(a) * r);
                     bouquetPoints.push({
                         x: pos.x,
@@ -132,79 +202,88 @@
                         type: 'core',
                         customChar: coreChars[c % coreChars.length],
                         phase: rand() * Math.PI * 2,
-                        glow: 0.9
+                        glow: 0.92
                     });
                 }
 
-                const petalCount = Math.floor(randRange(5, 8));
-                const petalChars = ['o', 'O', '0', '#', '*', '+', '=', ':'];
-                for (let p = 0; p < petalCount; p++) {
-                    const baseAngle = (p / petalCount) * Math.PI * 2 + randRange(-0.15, 0.15);
-                    const pLen = bloomRadius * randRange(0.88, 1.18);
-                    const pWidth = bloomRadius * randRange(0.45, 0.65);
-                    const cupLift = randRange(0.01, 0.055);
+                // Double-tiered ruffled corolla petals
+                const petalCount = Math.floor(randRange(6, 9));
+                const petalChars = ['O', '0', 'o', '#', '*', '+', '=', ':'];
+                for (let tier = 0; tier < 2; tier++) {
+                    const tierScale = tier === 0 ? 1.0 : 0.74;
+                    const tierLift = tier === 0 ? 0.025 : 0.052;
+                    const angleOffset = tier * (Math.PI / petalCount);
 
-                    const radialSteps = 6;
-                    const angularSteps = 5;
-                    for (let rs = 1; rs <= radialSteps; rs++) {
-                        const rf = rs / radialSteps;
-                        const envelope = Math.sin(rf * Math.PI * 0.88);
-                        for (let as = -angularSteps; as <= angularSteps; as++) {
-                            const af = as / angularSteps;
-                            if (Math.abs(af) > envelope + 0.15) continue;
+                    for (let p = 0; p < petalCount; p++) {
+                        const baseAngle = (p / petalCount) * Math.PI * 2 + angleOffset + randRange(-0.1, 0.1);
+                        const pLen = bloomRadius * tierScale * randRange(0.92, 1.18);
+                        const pWidth = bloomRadius * tierScale * randRange(0.46, 0.64);
+                        const cupLift = tierLift + randRange(0.01, 0.04);
 
-                            const localDist = rf * pLen;
-                            const spreadAngle = baseAngle + af * (pWidth / Math.max(0.04, pLen));
-                            const lx = Math.cos(spreadAngle) * localDist;
-                            const lz = Math.sin(spreadAngle) * localDist;
-                            const ly = Math.pow(rf, 1.5) * cupLift - Math.abs(af) * 0.012;
+                        const radialSteps = 8;
+                        const angularSteps = 6;
+                        for (let rs = 1; rs <= radialSteps; rs++) {
+                            const rf = rs / radialSteps;
+                            const envelope = Math.sin(rf * Math.PI * 0.88);
+                            for (let as = -angularSteps; as <= angularSteps; as++) {
+                                const af = as / angularSteps;
+                                if (Math.abs(af) > envelope + 0.14) continue;
 
-                            const pos = transformLocal(lx, ly, lz);
-                            const isEdge = rf > 0.82 || Math.abs(af) > envelope * 0.85;
-                            const colorPool = isEdge ? theme.outer : [theme.accent, ...theme.outer];
-                            const col = colorPool[(rs + Math.abs(as) + p) % colorPool.length];
-                            const ch = isEdge
-                                ? (rf > 0.9 ? '.' : 'o')
-                                : petalChars[(rs * 3 + Math.abs(as)) % petalChars.length];
+                                const localDist = rf * pLen;
+                                const spreadAngle = baseAngle + af * (pWidth / Math.max(0.04, pLen));
+                                const lx = Math.cos(spreadAngle) * localDist;
+                                const lz = Math.sin(spreadAngle) * localDist;
+                                const ly = Math.pow(rf, 1.45) * cupLift - Math.abs(af) * 0.014;
 
-                            bouquetPoints.push({
-                                x: pos.x,
-                                y: pos.y,
-                                z: pos.z,
-                                color: col,
-                                type: 'petal',
-                                customChar: ch,
-                                phase: rand() * Math.PI * 2,
-                                glow: isEdge ? 0.55 : 0.78
-                            });
+                                const pos = transformLocal(lx, ly, lz);
+                                const isEdge = rf > 0.82 || Math.abs(af) > envelope * 0.84;
+                                const colorPool = isEdge ? theme.outer : [theme.accent, ...theme.outer];
+                                const col = colorPool[(rs + Math.abs(as) + p + tier) % colorPool.length];
+                                const ch = isEdge
+                                    ? (rf > 0.91 ? '.' : 'o')
+                                    : petalChars[(rs * 3 + Math.abs(as) + tier) % petalChars.length];
+
+                                bouquetPoints.push({
+                                    x: pos.x,
+                                    y: pos.y,
+                                    z: pos.z,
+                                    color: col,
+                                    type: 'petal',
+                                    customChar: ch,
+                                    phase: rand() * Math.PI * 2,
+                                    glow: isEdge ? 0.58 : 0.82
+                                });
+                            }
                         }
                     }
                 }
             }
 
             /**
-             * Helper: Adds a prominent 3D ASCII Sunflower head at (fx, fy, fz)
-             * Wide circular dark-brown and burnt-amber phyllotaxis seed center + 18 radiating golden petals
+             * Helper: Adds a giant, ultra-detailed 3D ASCII Sunflower head at (fx, fy, fz)
+             * Wide Fibonacci phyllotaxis seed disc + double-ringed pointed golden ray petals + green sepal collar
              */
             function addSunflowerHead(fx, fy, fz, scale, tiltX, tiltZ) {
                 const transformLocal = createTransform(fx, fy, fz, tiltX, tiltZ);
-                const discRadius = 0.145 * scale;
-                const petalOuterRadius = 0.305 * scale;
+                const discRadius = 0.175 * scale;
+                const petalOuterRadius = 0.365 * scale;
 
-                // 1. Dense Phyllotaxis seed disc (@, #, 0, *) in deep espresso brown & burnt amber
+                addCalyxCup(transformLocal, discRadius * 0.92, 0.055 * scale);
+
+                // 1. Dense Fibonacci Phyllotaxis seed disc (@, #, 0, *) in deep espresso brown & burnt amber
                 const discColors = ['#3b2314', '#5c3317', '#78350f', '#92400e', '#451a03', '#b45309'];
                 const discChars = ['@', '#', '0', '*', 'O', '+'];
-                const seedCount = 105;
+                const seedCount = 175;
                 for (let s = 0; s < seedCount; s++) {
                     const frac = s / seedCount;
                     const r = Math.sqrt(frac) * discRadius;
                     const angle = s * 2.39996323; // Golden angle spiral
-                    const domeY = Math.cos(frac * Math.PI * 0.5) * 0.034 * scale;
+                    const domeY = Math.cos(frac * Math.PI * 0.5) * 0.045 * scale;
                     const pos = transformLocal(Math.cos(angle) * r, domeY, Math.sin(angle) * r);
 
-                    const isRim = frac > 0.82;
-                    const col = isRim ? '#d97706' : discColors[s % discColors.length];
-                    const ch = isRim ? '0' : discChars[s % discChars.length];
+                    const isOuterFloret = frac > 0.78;
+                    const col = isOuterFloret ? (frac > 0.9 ? '#f59e0b' : '#d97706') : discColors[s % discColors.length];
+                    const ch = isOuterFloret ? (frac > 0.9 ? '*' : '0') : discChars[s % discChars.length];
 
                     bouquetPoints.push({
                         x: pos.x,
@@ -214,36 +293,37 @@
                         type: 'core',
                         customChar: ch,
                         phase: rand() * Math.PI * 2,
-                        glow: isRim ? 0.78 : 0.38
+                        glow: isOuterFloret ? 0.82 : 0.42
                     });
                 }
 
-                // 2. 18 pointed radiating golden-yellow sunflower petals
-                const rayCount = 18;
+                // 2. 22 pointed radiating golden-yellow sunflower ray petals in staggered double ring
+                const rayCount = 22;
                 const petalColors = ['#ffd166', '#ffb703', '#fca311', '#ffe066', '#f59e0b', '#fff3b0'];
-                const rayChars = ['O', '0', 'o', '+', '*'];
+                const rayChars = ['O', '0', 'o', '+', '*', ':'];
                 for (let p = 0; p < rayCount; p++) {
-                    const angle = (p / rayCount) * Math.PI * 2 + (p % 2) * 0.045;
-                    const layerOffset = (p % 2 === 0) ? 0.008 : -0.006;
-                    const pLen = petalOuterRadius * randRange(0.95, 1.07);
-                    const pHalfWidth = 0.032 * scale;
+                    const angle = (p / rayCount) * Math.PI * 2 + (p % 2) * 0.04;
+                    const layerOffset = (p % 2 === 0) ? 0.012 : -0.008;
+                    const pLen = petalOuterRadius * randRange(0.95, 1.08);
+                    const pHalfWidth = 0.038 * scale;
 
-                    for (let rs = 1; rs <= 7; rs++) {
-                        const rf = rs / 7;
-                        const dist = discRadius * 0.86 + rf * (pLen - discRadius * 0.86);
-                        const widthEnv = Math.sin(rf * Math.PI) * (1 - rf * 0.35);
-                        const wSteps = rf > 0.85 ? 0 : 1;
+                    for (let rs = 1; rs <= 10; rs++) {
+                        const rf = rs / 10;
+                        const dist = discRadius * 0.84 + rf * (pLen - discRadius * 0.84);
+                        const widthEnv = Math.sin(rf * Math.PI) * (1 - rf * 0.32);
+                        const wSteps = rf > 0.86 ? 0 : (rf > 0.65 ? 1 : 2);
 
                         for (let ws = -wSteps; ws <= wSteps; ws++) {
-                            const perp = ws * pHalfWidth * widthEnv;
+                            const wf = wSteps === 0 ? 0 : ws / wSteps;
+                            const perp = wf * pHalfWidth * widthEnv;
                             const lx = Math.cos(angle) * dist - Math.sin(angle) * perp;
                             const lz = Math.sin(angle) * dist + Math.cos(angle) * perp;
-                            const ly = layerOffset - Math.pow(rf, 1.8) * 0.022;
+                            const ly = layerOffset - Math.pow(rf, 1.75) * 0.028 + (1 - Math.abs(wf)) * 0.006;
 
                             const pos = transformLocal(lx, ly, lz);
                             const isTip = rf > 0.84;
                             const col = isTip ? '#fff3b0' : petalColors[(p + rs + Math.abs(ws)) % petalColors.length];
-                            const ch = isTip ? (rf > 0.94 ? '*' : 'o') : rayChars[(rs + p) % rayChars.length];
+                            const ch = isTip ? (rf > 0.94 ? '*' : 'o') : rayChars[(rs + p + Math.abs(ws)) % rayChars.length];
 
                             bouquetPoints.push({
                                 x: pos.x,
@@ -253,7 +333,7 @@
                                 type: 'petal',
                                 customChar: ch,
                                 phase: rand() * Math.PI * 2,
-                                glow: isTip ? 0.85 : 0.72
+                                glow: isTip ? 0.88 : 0.75
                             });
                         }
                     }
@@ -261,26 +341,27 @@
             }
 
             /**
-             * Helper: Adds a 3D cup/goblet-shaped ASCII Tulip bloom at (fx, fy, fz)
-             * Rounded base tapering slightly with three distinct scalloped top tips
+             * Helper: Adds a sculpted 3D cup/goblet-shaped ASCII Tulip bloom at (fx, fy, fz)
+             * Rounded base tapering gracefully with overlapping curved inner and outer tepals
              */
             function addTulipHead(fx, fy, fz, palette, scale, tiltX, tiltZ) {
                 const transformLocal = createTransform(fx, fy, fz, tiltX, tiltZ);
-                const cupHeight = 0.26 * scale;
-                const cupRadius = 0.118 * scale;
+                const cupHeight = 0.31 * scale;
+                const cupRadius = 0.142 * scale;
 
-                // Inner golden stamen core inside the tulip goblet
-                for (let c = 0; c < 12; c++) {
-                    const a = (c / 12) * Math.PI * 2;
-                    const r = 0.025 * scale;
-                    const pos = transformLocal(Math.cos(a) * r, 0.07 * scale, Math.sin(a) * r);
+                // Inner dark-tipped golden stamen filaments inside the goblet
+                for (let c = 0; c < 18; c++) {
+                    const a = (c / 18) * Math.PI * 2;
+                    const r = (c % 3 === 0 ? 0.015 : 0.032) * scale;
+                    const h = (0.06 + (c % 3) * 0.035) * scale;
+                    const pos = transformLocal(Math.cos(a) * r, h, Math.sin(a) * r);
                     bouquetPoints.push({
                         x: pos.x,
                         y: pos.y,
                         z: pos.z,
-                        color: '#ffd32a',
+                        color: h > 0.11 * scale ? '#3b2314' : '#ffd32a',
                         type: 'core',
-                        customChar: c % 2 === 0 ? '*' : '|',
+                        customChar: h > 0.11 * scale ? '@' : '|',
                         phase: rand() * Math.PI * 2,
                         glow: 0.85
                     });
@@ -291,21 +372,19 @@
                 for (let p = 0; p < 6; p++) {
                     const isOuter = p < 3;
                     const baseAngle = ((p % 3) / 3) * Math.PI * 2 + (isOuter ? 0 : Math.PI / 3);
-                    const rScale = isOuter ? 1.05 : 0.88;
-                    const hScale = isOuter ? 1.02 : 0.95;
+                    const rScale = isOuter ? 1.06 : 0.86;
+                    const hScale = isOuter ? 1.03 : 0.96;
 
-                    const hSteps = 10;
-                    const wSteps = 4;
+                    const hSteps = 14;
+                    const wSteps = 5;
                     for (let hs = 0; hs <= hSteps; hs++) {
-                        const v = hs / hSteps; // 0 at rounded base -> 1 at scalloped tip
-                        // Goblet profile: rounded belly at v=0.35, tapering gently inward near top
+                        const v = hs / hSteps;
                         const profileR = cupRadius * rScale * (0.28 + Math.sin(v * Math.PI * 0.78) * 0.86);
-                        const angularSpan = (0.62 - v * 0.22) * (isOuter ? 1.08 : 0.92);
+                        const angularSpan = (0.64 - v * 0.22) * (isOuter ? 1.08 : 0.92);
 
                         for (let ws = -wSteps; ws <= wSteps; ws++) {
                             const wf = ws / wSteps;
-                            // Pointed scalloped top tip silhouette
-                            if (v > 0.70 && Math.abs(wf) > (1.06 - v) * 3.1) continue;
+                            if (v > 0.68 && Math.abs(wf) > (1.06 - v) * 3.0) continue;
 
                             const theta = baseAngle + wf * angularSpan;
                             const r = profileR * (1 - Math.abs(wf) * 0.12);
@@ -319,7 +398,7 @@
                                 ? palette.rim
                                 : palette.body[(hs + Math.abs(ws) + p) % palette.body.length];
                             const ch = isRim
-                                ? (v > 0.90 ? '^' : 'o')
+                                ? (v > 0.91 ? '^' : 'o')
                                 : (Math.abs(wf) === 1 ? (wf < 0 ? '(' : ')') : petalChars[(hs + p) % petalChars.length]);
 
                             bouquetPoints.push({
@@ -330,7 +409,7 @@
                                 type: 'petal',
                                 customChar: ch,
                                 phase: rand() * Math.PI * 2,
-                                glow: isRim ? 0.82 : 0.66
+                                glow: isRim ? 0.85 : 0.68
                             });
                         }
                     }
@@ -338,25 +417,27 @@
             }
 
             /**
-             * Helper: Adds a layered spiral 3D ASCII Rose bloom at (fx, fy, fz)
+             * Helper: Adds a lush spiral 3D ASCII Rose bloom at (fx, fy, fz)
              */
             function addRoseHead(fx, fy, fz, palette, scale, tiltX, tiltZ) {
                 const transformLocal = createTransform(fx, fy, fz, tiltX, tiltZ);
-                const maxR = 0.155 * scale;
-                const turns = 3.6;
-                const steps = 110;
+                const maxR = 0.185 * scale;
+                const turns = 4.2;
+                const steps = 165;
                 const roseChars = ['@', '0', 'O', 'o', '(', ')', '#', '*'];
+
+                addCalyxCup(transformLocal, maxR * 0.55, 0.045 * scale);
 
                 for (let i = 0; i < steps; i++) {
                     const frac = i / steps;
                     const angle = frac * turns * Math.PI * 2;
-                    const r = (0.08 + frac * 0.92) * maxR;
-                    const cupY = (1 - frac * 0.55) * 0.065 * scale + Math.sin(angle * 3) * 0.012;
+                    const r = (0.07 + frac * 0.93) * maxR;
+                    const cupY = (1 - frac * 0.52) * 0.078 * scale + Math.sin(angle * 3) * 0.015;
 
                     for (let layer = 0; layer < 2; layer++) {
-                        const ly = cupY - layer * 0.018 * scale;
+                        const ly = cupY - layer * 0.022 * scale;
                         const pos = transformLocal(Math.cos(angle) * r, ly, Math.sin(angle) * r);
-                        const col = frac < 0.3
+                        const col = frac < 0.28
                             ? palette.core
                             : palette.body[(i + layer) % palette.body.length];
                         const ch = roseChars[(i + layer * 2) % roseChars.length];
@@ -369,43 +450,40 @@
                             type: frac < 0.25 ? 'core' : 'petal',
                             customChar: ch,
                             phase: rand() * Math.PI * 2,
-                            glow: frac > 0.75 ? 0.85 : 0.65
+                            glow: frac > 0.72 ? 0.86 : 0.68
                         });
                     }
                 }
             }
 
             /**
-             * Builds the 3D bouquet structure for the selected flower mode:
-             * - Mode 0 ('wildflowers'): 26 multi-layered wildflower heads + converging cone stems
-             * - Mode 1 ('sunflowers'): 9 large 3D sunflowers with wide phyllotaxis centers & broad leaves
-             * - Mode 2 ('tulips'): 14 cup-shaped tulips in crimson/pink, orange, yellow & royal violet + upright leaves
-             * - Mode 3 ('mixed'): Spiral 3D roses, sunflowers, tulips, and delicate wildflowers
+             * Builds the ultra-detailed 3D bouquet point cloud and computes its exact 3D bounding box
+             * so the camera scales it generously on both mobile portrait and desktop screens without clipping.
              */
             function buildBouquetGeometry(mode = 'wildflowers') {
                 bouquetPoints.length = 0;
                 seed = 8842 + currentModeIndex * 1337;
 
-                const baseTip = { x: 0, y: -1.06, z: 0 };
+                const baseTip = { x: 0, y: -1.12, z: 0 };
 
                 if (mode === 'wildflowers') {
-                    const numFlowers = 26;
+                    const numFlowers = 28;
                     const flowers = [];
 
                     for (let i = 0; i < numFlowers; i++) {
                         const t = i / (numFlowers - 1);
                         const goldenAngle = i * 2.39996323;
-                        const radialSpread = 0.16 + Math.pow(t, 0.72) * 0.86 + randRange(-0.06, 0.06);
-                        const heightY = 0.94 - Math.pow(t, 1.15) * 0.80 + randRange(-0.08, 0.08);
+                        const radialSpread = 0.14 + Math.pow(t, 0.72) * 0.88 + randRange(-0.05, 0.05);
+                        const heightY = 1.02 - Math.pow(t, 1.15) * 0.84 + randRange(-0.07, 0.07);
 
                         const fx = Math.cos(goldenAngle) * radialSpread;
                         const fz = Math.sin(goldenAngle) * radialSpread;
                         const fy = heightY;
 
                         const theme = FLOWER_THEMES[i % FLOWER_THEMES.length];
-                        const scale = randRange(0.75, 1.28);
-                        const tiltX = Math.atan2(fz, fy + 1.1) * 0.65 + randRange(-0.2, 0.2);
-                        const tiltZ = -Math.atan2(fx, fy + 1.1) * 0.65 + randRange(-0.2, 0.2);
+                        const scale = randRange(0.82, 1.32);
+                        const tiltX = Math.atan2(fz, fy + 1.15) * 0.65 + randRange(-0.18, 0.18);
+                        const tiltZ = -Math.atan2(fx, fy + 1.15) * 0.65 + randRange(-0.18, 0.18);
 
                         flowers.push({ fx, fy, fz, theme, scale, tiltX, tiltZ });
                     }
@@ -414,16 +492,16 @@
                         const strandCount = idx % 2 === 0 ? 3 : 2;
                         for (let s = 0; s < strandCount; s++) {
                             const offsetAngle = (s / strandCount) * Math.PI * 2 + idx;
-                            const spreadFactor = s === 0 ? 0 : randRange(0.015, 0.045);
+                            const spreadFactor = s === 0 ? 0 : randRange(0.014, 0.042);
                             const endX = fl.fx + Math.cos(offsetAngle) * spreadFactor;
                             const endZ = fl.fz + Math.sin(offsetAngle) * spreadFactor;
                             const endY = fl.fy - 0.03;
 
                             const ctrlX = endX * 0.42 + Math.cos(offsetAngle) * 0.04;
                             const ctrlZ = endZ * 0.42 + Math.sin(offsetAngle) * 0.04;
-                            const ctrlY = -0.35 + randRange(-0.08, 0.08);
+                            const ctrlY = -0.38 + randRange(-0.08, 0.08);
 
-                            const steps = 68;
+                            const steps = 84;
                             for (let st = 0; st <= steps; st++) {
                                 const u = st / steps;
                                 const inv = 1 - u;
@@ -449,20 +527,20 @@
                         addWildflowerHead(fl.fx, fl.fy, fl.fz, fl.theme, fl.scale, fl.tiltX, fl.tiltZ);
                     });
 
-                    // Filler foliage & baby's-breath specks
-                    for (let f = 0; f < 34; f++) {
-                        const angle = (f / 34) * Math.PI * 2 + randRange(-0.2, 0.2);
-                        const rad = randRange(0.25, 0.98);
-                        const topY = randRange(-0.15, 0.86);
+                    // Rich filler foliage, serrated leaves & baby's-breath clusters
+                    for (let f = 0; f < 40; f++) {
+                        const angle = (f / 40) * Math.PI * 2 + randRange(-0.2, 0.2);
+                        const rad = randRange(0.24, 0.98);
+                        const topY = randRange(-0.15, 0.92);
                         const tx = Math.cos(angle) * rad;
                         const tz = Math.sin(angle) * rad;
 
-                        const steps = 42;
+                        const steps = 54;
                         for (let st = 0; st <= steps; st++) {
                             const u = st / steps;
                             const px = tx * Math.pow(u, 0.92);
                             const pz = tz * Math.pow(u, 0.92);
-                            const py = -1.06 + (topY + 1.06) * u;
+                            const py = -1.12 + (topY + 1.12) * u;
 
                             bouquetPoints.push({
                                 x: px,
@@ -471,35 +549,35 @@
                                 color: STEM_PALETTE[(f + st) % STEM_PALETTE.length],
                                 type: 'stem',
                                 phase: rand() * Math.PI * 2,
-                                glow: 0.1
+                                glow: 0.12
                             });
 
-                            if (u > 0.45 && st % 5 === 0) {
+                            if (u > 0.42 && st % 5 === 0) {
                                 const side = (st % 10 === 0) ? 1 : -1;
                                 bouquetPoints.push({
-                                    x: px - Math.sin(angle) * 0.045 * side,
-                                    y: py + 0.015,
-                                    z: pz + Math.cos(angle) * 0.045 * side,
+                                    x: px - Math.sin(angle) * 0.05 * side,
+                                    y: py + 0.016,
+                                    z: pz + Math.cos(angle) * 0.05 * side,
                                     color: '#8eb899',
                                     type: 'leaf',
                                     customChar: side > 0 ? '/' : '\\',
                                     phase: rand() * Math.PI * 2,
-                                    glow: 0.25
+                                    glow: 0.26
                                 });
                             }
                         }
 
                         if (f % 2 === 0) {
-                            for (let b = 0; b < 4; b++) {
+                            for (let b = 0; b < 5; b++) {
                                 bouquetPoints.push({
-                                    x: tx + randRange(-0.04, 0.04),
-                                    y: topY + randRange(-0.03, 0.04),
-                                    z: tz + randRange(-0.04, 0.04),
+                                    x: tx + randRange(-0.045, 0.045),
+                                    y: topY + randRange(-0.035, 0.045),
+                                    z: tz + randRange(-0.045, 0.045),
                                     color: b % 2 === 0 ? '#f5f6fa' : '#feca57',
                                     type: 'speck',
                                     customChar: b === 0 ? 'o' : '.',
                                     phase: rand() * Math.PI * 2,
-                                    glow: 0.65
+                                    glow: 0.68
                                 });
                             }
                         }
@@ -510,26 +588,26 @@
                         const isCrown = i === 0;
                         const t = isCrown ? 0 : (i - 1) / (numSunflowers - 2);
                         const angle = i * 2.39996323;
-                        const radialSpread = isCrown ? 0.05 : (0.30 + t * 0.56 + randRange(-0.04, 0.04));
-                        const fy = isCrown ? 0.90 : (0.76 - t * 0.54 + randRange(-0.05, 0.05));
+                        const radialSpread = isCrown ? 0.04 : (0.30 + t * 0.56 + randRange(-0.03, 0.03));
+                        const fy = isCrown ? 0.96 : (0.82 - t * 0.56 + randRange(-0.04, 0.04));
                         const fx = Math.cos(angle) * radialSpread;
                         const fz = Math.sin(angle) * radialSpread;
-                        const scale = isCrown ? 1.28 : randRange(0.98, 1.20);
+                        const scale = isCrown ? 1.28 : randRange(1.0, 1.20);
 
-                        const tiltX = Math.atan2(fz, fy + 1.1) * 0.85 + 0.25;
-                        const tiltZ = -Math.atan2(fx, fy + 1.1) * 0.85;
+                        const tiltX = Math.atan2(fz, fy + 1.15) * 0.82 + 0.24;
+                        const tiltZ = -Math.atan2(fx, fy + 1.15) * 0.82;
 
-                        // Sturdy thick multi-strand sunflower stem
-                        for (let s = 0; s < 4; s++) {
-                            const sa = (s / 4) * Math.PI * 2;
-                            const off = 0.016;
+                        // Sturdy thick multi-strand ribbed sunflower stems
+                        for (let s = 0; s < 5; s++) {
+                            const sa = (s / 5) * Math.PI * 2;
+                            const off = 0.018;
                             const endX = fx + Math.cos(sa) * off;
                             const endZ = fz + Math.sin(sa) * off;
                             const ctrlX = endX * 0.35;
                             const ctrlZ = endZ * 0.35;
-                            const ctrlY = -0.35;
+                            const ctrlY = -0.38;
 
-                            const steps = 72;
+                            const steps = 86;
                             for (let st = 0; st <= steps; st++) {
                                 const u = st / steps;
                                 const inv = 1 - u;
@@ -547,25 +625,25 @@
                                     glow: 0.18
                                 });
 
-                                // Broad heart/oval sunflower leaves along mid-stem
-                                if (s === 0 && (st === 28 || st === 46)) {
-                                    const leafSide = st === 28 ? 1 : -1;
+                                // Broad heart-shaped sunflower leaves with central vein along mid-stem
+                                if (s === 0 && (st === 34 || st === 56)) {
+                                    const leafSide = st === 34 ? 1 : -1;
                                     const lDirX = Math.cos(angle + leafSide * 1.1);
                                     const lDirZ = Math.sin(angle + leafSide * 1.1);
-                                    for (let lr = 1; lr <= 6; lr++) {
-                                        const lf = lr / 6;
-                                        const span = Math.sin(lf * Math.PI) * 0.082;
-                                        for (let lw = -2; lw <= 2; lw++) {
-                                            const wf = lw / 2;
+                                    for (let lr = 1; lr <= 8; lr++) {
+                                        const lf = lr / 8;
+                                        const span = Math.sin(lf * Math.PI) * 0.092;
+                                        for (let lw = -3; lw <= 3; lw++) {
+                                            const wf = lw / 3;
                                             bouquetPoints.push({
-                                                x: px + lDirX * lf * 0.23 - lDirZ * wf * span,
-                                                y: py + Math.sin(lf * Math.PI * 0.8) * 0.048 - lf * 0.03,
-                                                z: pz + lDirZ * lf * 0.23 + lDirX * wf * span,
-                                                color: lr > 4 ? '#9fc4a8' : '#6f947c',
+                                                x: px + lDirX * lf * 0.25 - lDirZ * wf * span,
+                                                y: py + Math.sin(lf * Math.PI * 0.8) * 0.052 - lf * 0.03,
+                                                z: pz + lDirZ * lf * 0.25 + lDirX * wf * span,
+                                                color: lw === 0 ? '#add4b7' : (lr > 5 ? '#9ac2a4' : '#648a73'),
                                                 type: 'leaf',
-                                                customChar: Math.abs(wf) === 1 ? '~' : '#',
+                                                customChar: lw === 0 ? '/' : (Math.abs(wf) === 1 ? '~' : '#'),
                                                 phase: rand() * Math.PI * 2,
-                                                glow: 0.25
+                                                glow: 0.26
                                             });
                                         }
                                     }
@@ -577,36 +655,35 @@
                     }
                 } else if (mode === 'tulips') {
                     const tulipPalettes = [
-                        { body: ['#ff4d6d', '#ff758f', '#c9184a', '#ff8fa3'], rim: '#fff0f3' }, // Crimson / Pink
-                        { body: ['#ff9f43', '#ff7b00', '#ffaa00', '#ff6b35'], rim: '#fff3b0' }, // Sunset Orange
-                        { body: ['#ffd32a', '#ffdd00', '#ffea00', '#ffb700'], rim: '#fffffc' }, // Sunshine Yellow
-                        { body: ['#9b59b6', '#c77dff', '#8e44ad', '#e0aaff'], rim: '#f3d5ff' }  // Royal Violet
+                        { body: ['#ff4d6d', '#ff758f', '#c9184a', '#ff8fa3'], rim: '#fff0f3' },
+                        { body: ['#ff9f43', '#ff7b00', '#ffaa00', '#ff6b35'], rim: '#fff3b0' },
+                        { body: ['#ffd32a', '#ffdd00', '#ffea00', '#ffb700'], rim: '#fffffc' },
+                        { body: ['#9b59b6', '#c77dff', '#8e44ad', '#e0aaff'], rim: '#f3d5ff' }
                     ];
 
                     const numTulips = 14;
                     for (let i = 0; i < numTulips; i++) {
                         const t = i / (numTulips - 1);
                         const angle = i * 2.39996323;
-                        const radialSpread = 0.12 + Math.pow(t, 0.78) * 0.68 + randRange(-0.04, 0.04);
-                        const fy = 0.86 - Math.pow(t, 1.1) * 0.66 + randRange(-0.05, 0.05);
+                        const radialSpread = 0.12 + Math.pow(t, 0.78) * 0.70 + randRange(-0.03, 0.03);
+                        const fy = 0.90 - Math.pow(t, 1.1) * 0.68 + randRange(-0.04, 0.04);
                         const fx = Math.cos(angle) * radialSpread;
                         const fz = Math.sin(angle) * radialSpread;
                         const palette = tulipPalettes[i % tulipPalettes.length];
-                        const scale = randRange(0.94, 1.20);
+                        const scale = randRange(0.96, 1.22);
 
                         const tiltX = Math.atan2(fz, fy + 1.2) * 0.55;
                         const tiltZ = -Math.atan2(fx, fy + 1.2) * 0.55;
 
-                        // Tall slender green tulip stems
-                        for (let s = 0; s < 2; s++) {
+                        for (let s = 0; s < 3; s++) {
                             const off = s === 0 ? 0 : 0.012;
-                            const endX = fx + Math.cos(angle + s) * off;
-                            const endZ = fz + Math.sin(angle + s) * off;
+                            const endX = fx + Math.cos(angle + s * 2.1) * off;
+                            const endZ = fz + Math.sin(angle + s * 2.1) * off;
                             const ctrlX = endX * 0.32;
                             const ctrlZ = endZ * 0.32;
-                            const ctrlY = -0.32;
+                            const ctrlY = -0.35;
 
-                            const steps = 68;
+                            const steps = 82;
                             for (let st = 0; st <= steps; st++) {
                                 const u = st / steps;
                                 const inv = 1 - u;
@@ -629,32 +706,33 @@
                         addTulipHead(fx, fy, fz, palette, scale, tiltX, tiltZ);
                     }
 
-                    // Long upright blade-like tulip leaves
-                    const leafCount = 12;
+                    // Sweeping folded lanceolate tulip leaves
+                    const leafCount = 14;
                     for (let l = 0; l < leafCount; l++) {
                         const la = (l / leafCount) * Math.PI * 2 + 0.2;
-                        const leafHeight = randRange(0.28, 0.74);
-                        const archOut = randRange(0.50, 0.86);
-                        const steps = 46;
+                        const leafHeight = randRange(0.32, 0.82);
+                        const archOut = randRange(0.52, 0.90);
+                        const steps = 58;
 
                         for (let st = 0; st <= steps; st++) {
                             const u = st / steps;
                             const widthEnv = Math.sin(u * Math.PI * 0.92);
                             const r = Math.pow(u, 1.35) * archOut;
-                            const py = -1.02 + (leafHeight + 1.02) * Math.sin(u * Math.PI * 0.56);
+                            const py = -1.08 + (leafHeight + 1.08) * Math.sin(u * Math.PI * 0.56);
                             const cx = Math.cos(la) * r;
                             const cz = Math.sin(la) * r;
 
                             const perpX = -Math.sin(la);
                             const perpZ = Math.cos(la);
-                            const halfW = widthEnv * 0.055;
+                            const halfW = widthEnv * 0.062;
 
-                            for (let w = -1; w <= 1; w++) {
+                            for (let w = -2; w <= 2; w++) {
+                                const wf = w / 2;
                                 bouquetPoints.push({
-                                    x: cx + perpX * w * halfW,
+                                    x: cx + perpX * wf * halfW,
                                     y: py,
-                                    z: cz + perpZ * w * halfW,
-                                    color: u > 0.7 ? '#a8cfb2' : '#7fa68a',
+                                    z: cz + perpZ * wf * halfW,
+                                    color: w === 0 ? '#add4b7' : (u > 0.7 ? '#9ac2a4' : '#759e83'),
                                     type: 'leaf',
                                     customChar: w === 0 ? '|' : (w < 0 ? '(' : ')'),
                                     phase: rand() * Math.PI * 2,
@@ -664,8 +742,8 @@
                         }
                     }
                 } else {
-                    // Mode 3 ('mixed'): Spiral 3D roses, sunflowers, tulips, and delicate wildflowers
-                    const numBlooms = 18;
+                    // Mode 3 ('mixed'): Spiral 3D roses, giant sunflowers, sculpted tulips & wildflowers
+                    const numBlooms = 20;
                     const rosePalettes = [
                         { core: '#fff0f3', body: ['#ff4d6d', '#ff758f', '#ff8fa3', '#c9184a'] },
                         { core: '#fff8e7', body: ['#ffb703', '#fb8500', '#ffd166', '#f77f00'] },
@@ -677,20 +755,20 @@
                         const t = i / (numBlooms - 1);
                         const angle = i * 2.39996323;
                         const radialSpread = 0.14 + Math.pow(t, 0.76) * 0.78;
-                        const fy = 0.90 - Math.pow(t, 1.12) * 0.73 + randRange(-0.05, 0.05);
+                        const fy = 0.96 - Math.pow(t, 1.12) * 0.76 + randRange(-0.04, 0.04);
                         const fx = Math.cos(angle) * radialSpread;
                         const fz = Math.sin(angle) * radialSpread;
-                        const tiltX = Math.atan2(fz, fy + 1.1) * 0.68;
-                        const tiltZ = -Math.atan2(fx, fy + 1.1) * 0.68;
+                        const tiltX = Math.atan2(fz, fy + 1.15) * 0.68;
+                        const tiltZ = -Math.atan2(fx, fy + 1.15) * 0.68;
 
-                        for (let s = 0; s < 2; s++) {
-                            const off = s * 0.015;
-                            const endX = fx + Math.cos(angle + s) * off;
-                            const endZ = fz + Math.sin(angle + s) * off;
+                        for (let s = 0; s < 3; s++) {
+                            const off = s * 0.012;
+                            const endX = fx + Math.cos(angle + s * 2.1) * off;
+                            const endZ = fz + Math.sin(angle + s * 2.1) * off;
                             const ctrlX = endX * 0.38;
                             const ctrlZ = endZ * 0.38;
-                            const ctrlY = -0.34;
-                            const steps = 66;
+                            const ctrlY = -0.36;
+                            const steps = 80;
                             for (let st = 0; st <= steps; st++) {
                                 const u = st / steps;
                                 const inv = 1 - u;
@@ -710,19 +788,50 @@
                         if (kind === 0) {
                             addSunflowerHead(fx, fy, fz, 0.92, tiltX, tiltZ);
                         } else if (kind === 1) {
-                            addTulipHead(fx, fy, fz, tulipPal, 1.02, tiltX, tiltZ);
+                            addTulipHead(fx, fy, fz, tulipPal, 1.04, tiltX, tiltZ);
                         } else if (kind === 2) {
-                            addRoseHead(fx, fy, fz, rosePalettes[i % rosePalettes.length], 1.05, tiltX, tiltZ);
+                            addRoseHead(fx, fy, fz, rosePalettes[i % rosePalettes.length], 1.08, tiltX, tiltZ);
                         } else {
-                            addWildflowerHead(fx, fy, fz, FLOWER_THEMES[(i + 2) % FLOWER_THEMES.length], 1.15, tiltX, tiltZ);
+                            addWildflowerHead(fx, fy, fz, FLOWER_THEMES[(i + 2) % FLOWER_THEMES.length], 1.16, tiltX, tiltZ);
                         }
                     }
                 }
+
+                // Compute exact 3D bounding box for lossless mobile & desktop viewport framing
+                let minY = Infinity;
+                let maxY = -Infinity;
+                let maxR = 0.2;
+                for (let i = 0; i < bouquetPoints.length; i++) {
+                    const p = bouquetPoints[i];
+                    if (p.y < minY) minY = p.y;
+                    if (p.y > maxY) maxY = p.y;
+                    const r = Math.hypot(p.x, p.z);
+                    if (r > maxR) maxR = r;
+                }
+                bounds = {
+                    minY: Number.isFinite(minY) ? minY : -1.12,
+                    maxY: Number.isFinite(maxY) ? maxY : 1.15,
+                    maxRadiusXZ: Math.max(0.4, maxR)
+                };
             }
 
-            // Debounced click/tap handler to cycle through the 4 flower arrangements
-            function cycleFlowerVariety(e) {
-                if (e && e.cancelable) e.preventDefault();
+            /**
+             * Unified primary-pointer tap/click handler so scrolling or multi-touch never misfires
+             */
+            function onPointerDown(e) {
+                if (!e.isPrimary) return;
+                activePointerId = e.pointerId;
+                pointerDownX = e.clientX;
+                pointerDownY = e.clientY;
+            }
+
+            function onPointerUp(e) {
+                if (!e.isPrimary || e.pointerId !== activePointerId) return;
+                activePointerId = null;
+
+                const movedDist = Math.hypot(e.clientX - pointerDownX, e.clientY - pointerDownY);
+                if (movedDist > 18) return;
+
                 const now = performance.now();
                 if (now - lastSwitchTimestamp < 220) return;
                 lastSwitchTimestamp = now;
@@ -732,15 +841,20 @@
                 buildBouquetGeometry(FLOWER_MODES[currentModeIndex]);
             }
 
+            function onPointerCancel() {
+                activePointerId = null;
+            }
+
             /**
-             * Builds floating background ASCII particles:
-             * - Drifting ASCII star sparkles (., +, *, o)
-             * - Tiny fluttering ASCII butterflies: (v) / \v/ alternating wing frames
+             * Builds floating background ASCII particles scaled smoothly to screen size
              */
             function buildAmbientParticles() {
                 ambientParticles.length = 0;
+                const isCompact = Math.min(viewW, viewH) < 600;
+                const sparkleCount = isCompact ? 68 : 105;
+                const butterflyCount = isCompact ? 4 : 6;
 
-                for (let i = 0; i < 95; i++) {
+                for (let i = 0; i < sparkleCount; i++) {
                     const kinds = ['dot', 'dot', 'ring', 'plus', 'sparkleCluster'];
                     const kind = kinds[Math.floor(rand() * kinds.length)];
                     const colors = [
@@ -759,11 +873,10 @@
                     });
                 }
 
-                // Floating ASCII butterflies with alternating `(v)` / `\v/` wing frames
-                for (let b = 0; b < 6; b++) {
+                for (let b = 0; b < butterflyCount; b++) {
                     ambientParticles.push({
-                        nx: randRange(0.08, 0.92),
-                        ny: randRange(0.08, 0.86),
+                        nx: randRange(0.06, 0.94),
+                        ny: randRange(0.06, 0.86),
                         vx: randRange(-0.012, 0.012),
                         vy: randRange(-0.01, 0.006),
                         kind: 'butterfly',
@@ -774,29 +887,56 @@
                 }
             }
 
-            // Resize handler for HiDPI / Retina scaling and monospace grid calculation
+            /**
+             * Resize handler:
+             * - Fine monospace cells (`6.5px–8.5px` on mobile phones, `9px–11px` on tablets/desktops)
+             *   give ultra-high ASCII resolution while keeping every stem and petal huge & detailed.
+             */
             function resize() {
+                readSafeAreaInsets();
                 const dpr = Math.min(window.devicePixelRatio || 1, 2);
-                const width = Math.max(1, window.innerWidth);
-                const height = Math.max(1, window.innerHeight);
+                viewW = Math.max(1, window.innerWidth);
+                viewH = Math.max(1, window.innerHeight);
 
-                canvas.width = Math.floor(width * dpr);
-                canvas.height = Math.floor(height * dpr);
+                canvas.width = Math.floor(viewW * dpr);
+                canvas.height = Math.floor(viewH * dpr);
                 ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-                // Crisp 11px-13px monospace grid sizing across mobile, tablet, and desktop
-                const baseFont = Math.max(11, Math.min(13, Math.floor(Math.min(width, height) / 56)));
-                cellH = baseFont;
-                cellW = Math.max(6, Math.round(baseFont * 0.6));
+                const shortEdge = Math.min(viewW, viewH);
+                let baseFont;
+                if (shortEdge < 480) {
+                    // Mobile portrait phones: 7px - 8.5px ultra-crisp high-density cells
+                    baseFont = Math.max(7, Math.min(8.5, Math.round((shortEdge / 50) * 2) / 2));
+                } else if (shortEdge < 820) {
+                    // Tablets & large phones: 8.5px - 10px
+                    baseFont = Math.max(8.5, Math.min(10, Math.round((shortEdge / 68) * 2) / 2));
+                } else {
+                    // Desktop monitors: 10px - 11px
+                    baseFont = Math.max(10, Math.min(11, Math.floor(shortEdge / 82)));
+                }
 
-                cols = Math.max(1, Math.ceil(width / cellW));
-                rows = Math.max(1, Math.ceil(height / cellH));
+                cellH = baseFont;
+                cellW = Math.max(4.2, +(baseFont * 0.6).toFixed(2));
+
+                cols = Math.max(1, Math.ceil(viewW / cellW));
+                rows = Math.max(1, Math.ceil(viewH / cellH));
 
                 const total = cols * rows;
                 zBuffer = new Float32Array(total);
                 charBuffer = new Array(total);
                 colorBuffer = new Array(total);
                 glowBuffer = new Uint8Array(total);
+
+                // Cache radial vignette background gradient on resize
+                cachedBgGrad = ctx.createRadialGradient(
+                    viewW * 0.5, viewH * 0.47, viewW * 0.04,
+                    viewW * 0.5, viewH * 0.5, Math.max(viewW, viewH) * 0.8
+                );
+                cachedBgGrad.addColorStop(0, '#2b303a');
+                cachedBgGrad.addColorStop(0.6, '#202530');
+                cachedBgGrad.addColorStop(1, '#181c24');
+
+                buildAmbientParticles();
             }
 
             // Write a character into the grid if closer than current Z-buffer value
@@ -834,7 +974,6 @@
                         plotCell(gx, gy - 1, -10, '.', '#94a3b8', 0);
                         plotCell(gx, gy + 1, -10, '.', '#94a3b8', 0);
                     } else if (p.kind === 'butterfly') {
-                        // Alternating `(v)` and `\v/` wing frames
                         const flap = Math.sin(t * 5.0 + p.phase) > 0;
                         const topStr = flap ? '(v)' : '\\v/';
                         plotCell(gx - 1, gy, -9.5, topStr[0], p.color, 0.85);
@@ -845,25 +984,66 @@
                 }
             }
 
-            // Render subtle glowing pink ASCII quote framed at the very bottom
-            function renderBottomQuote() {
-                if (rows < 8 || cols < 24) return;
-                const quoteText = MODE_QUOTES[currentModeIndex];
-                const maxInner = Math.max(10, cols - 6);
-                const clipped = quoteText.length > maxInner
-                    ? quoteText.slice(0, maxInner)
-                    : quoteText;
+            /**
+             * Wraps long quotes onto up to 2 balanced lines on narrow portrait mobile screens
+             */
+            function wrapQuoteLines(text, maxInnerWidth) {
+                if (text.length <= maxInnerWidth) return [text];
+                const words = text.split(' ');
+                const lines = [];
+                let current = '';
 
-                const padded = ` ${clipped} `;
-                const borderStr = '.'.repeat(padded.length);
-                const startCol = Math.max(0, Math.floor((cols - padded.length) * 0.5));
-                const midRow = rows - 2;
-
-                for (let i = 0; i < padded.length; i++) {
-                    plotCell(startCol + i, midRow - 1, 50, borderStr[i], '#9d4edd', 0.35);
-                    plotCell(startCol + i, midRow, 50, padded[i], '#ff758f', 0.9);
-                    plotCell(startCol + i, midRow + 1, 50, borderStr[i], '#9d4edd', 0.35);
+                for (let i = 0; i < words.length; i++) {
+                    const word = words[i];
+                    if (!current) {
+                        current = word.slice(0, maxInnerWidth);
+                    } else if (current.length + 1 + word.length <= maxInnerWidth) {
+                        current += ' ' + word;
+                    } else {
+                        lines.push(current);
+                        current = word.slice(0, maxInnerWidth);
+                        if (lines.length === 1) break;
+                    }
                 }
+                if (current && lines.length < 2) {
+                    lines.push(current);
+                }
+                return lines;
+            }
+
+            // Render subtle glowing pink ASCII quote inside a dotted border above bottom safe-area inset
+            function renderBottomQuote() {
+                if (rows < 10 || cols < 18) return;
+                const quoteText = MODE_QUOTES[currentModeIndex];
+                const sidePadCols = Math.ceil(Math.max(safeLeft, safeRight) / cellW) + 2;
+                const maxInner = Math.max(12, cols - sidePadCols * 2 - 2);
+                const lines = wrapQuoteLines(quoteText, maxInner);
+
+                const boxWidth = Math.max(...lines.map(l => l.length)) + 2;
+                const borderStr = '.'.repeat(boxWidth);
+                const startCol = Math.max(0, Math.floor((cols - boxWidth) * 0.5));
+                const bottomPadRows = Math.ceil(safeBottom / cellH) + 1;
+                const bottomBorderRow = rows - 1 - bottomPadRows;
+                const topBorderRow = bottomBorderRow - lines.length - 1;
+
+                if (topBorderRow < 2) return;
+
+                for (let i = 0; i < boxWidth; i++) {
+                    plotCell(startCol + i, topBorderRow, 50, borderStr[i], '#9d4edd', 0.35);
+                    plotCell(startCol + i, bottomBorderRow, 50, borderStr[i], '#9d4edd', 0.35);
+                }
+
+                for (let l = 0; l < lines.length; l++) {
+                    const line = lines[l];
+                    const leftPad = Math.floor((boxWidth - line.length) * 0.5);
+                    const padded = ' '.repeat(leftPad) + line + ' '.repeat(boxWidth - line.length - leftPad);
+                    const rowY = topBorderRow + 1 + l;
+                    for (let i = 0; i < boxWidth; i++) {
+                        plotCell(startCol + i, rowY, 50, padded[i], '#ff758f', 0.92);
+                    }
+                }
+
+                return topBorderRow;
             }
 
             // Main animation loop
@@ -872,7 +1052,7 @@
                 lastTime = now;
                 const t = now * 0.001;
 
-                // Smoothly advance bloom transition after a click (~0.0035 rad/frame rotation pace)
+                // Smoothly advance bloom transition after a tap/click
                 if (transitionProgress < 1) {
                     transitionProgress = Math.min(1, transitionProgress + dt * 1.35);
                 }
@@ -886,10 +1066,13 @@
                 // 1. Render background ambient ASCII particles
                 renderAmbient(t);
 
-                // 2. Slow, hypnotic 3D rotation (~0.0035 rad/frame at 60fps => ~0.21 rad/sec) + gentle sway
+                // 2. Render bottom ASCII quote first so we know exact safe vertical headroom
+                const quoteTopRow = renderBottomQuote() || (rows - 4);
+
+                // 3. Slow, meditative 3D rotation + gentle organic sway
                 spinAngle += 0.21 * dt;
-                const swayZ = Math.sin(t * 0.35) * 0.042;
-                const swayX = 0.16 + Math.cos(t * 0.28) * 0.028;
+                const swayZ = Math.sin(t * 0.35) * 0.038;
+                const swayX = 0.16 + Math.cos(t * 0.28) * 0.025;
 
                 const cosY = Math.cos(spinAngle);
                 const sinY = Math.sin(spinAngle);
@@ -898,24 +1081,47 @@
                 const cosZ = Math.cos(swayZ);
                 const sinZ = Math.sin(swayZ);
 
-                // Responsive bouquet scale in character grid units
-                const scaleY = rows * 0.41;
-                const scaleX = scaleY * (cellH / cellW);
+                // Bounding-box-calibrated responsive scaling:
+                // Fills ~90% of usable height and ~93% of usable width on BOTH mobile portrait and desktop without clipping
+                const topPadRows = Math.ceil(safeTop / cellH) + 1.5;
+                const bottomLimitRow = Math.max(topPadRows + 12, quoteTopRow - 1.2);
+                const usableRows = bottomLimitRow - topPadRows;
+                const sideSafeCols = Math.ceil(Math.max(safeLeft, safeRight) / cellW) + 1.5;
+                const usableCols = Math.max(20, cols - sideSafeCols * 2);
+
+                const cameraDist = 3.8;
+                const frontPersp = cameraDist / Math.max(1.5, cameraDist - bounds.maxRadiusXZ * 0.92);
+                const worldHeight = Math.max(1.5, bounds.maxY - bounds.minY);
+                const worldMidY = (bounds.maxY + bounds.minY) * 0.5;
+
+                // Desired scale in grid rows/cols to fill viewport generously without clipping
+                const maxScaleYFromHeight = (usableRows * 0.93) / (worldHeight * frontPersp);
+                const maxScaleXFromWidth = (usableCols * 0.94) / (bounds.maxRadiusXZ * 2.04 * frontPersp);
+                const maxScaleYFromWidth = maxScaleXFromWidth * (cellW / cellH);
+
+                // On tall mobile portrait screens, allow slight vertical elongation so the bouquet looks tall & grand
+                const isPortrait = viewH > viewW * 1.15;
+                const scaleY = isPortrait
+                    ? Math.min(maxScaleYFromHeight, maxScaleYFromWidth * 1.38)
+                    : Math.min(maxScaleYFromHeight, maxScaleYFromWidth);
+                const scaleX = isPortrait
+                    ? Math.min(maxScaleXFromWidth, scaleY * (cellH / cellW))
+                    : scaleY * (cellH / cellW);
+
                 const centerX = cols * 0.5;
-                const centerY = rows * 0.47;
-                const cameraDist = 3.4;
+                const centerY = topPadRows + usableRows * 0.5 + worldMidY * scaleY * 0.95;
 
                 // Project and rasterize every 3D bouquet point into the ASCII grid
                 for (let i = 0; i < bouquetPoints.length; i++) {
                     const pt = bouquetPoints[i];
 
-                    const heightFactor = Math.max(0, (pt.y + 1.06) * 0.5);
+                    const heightFactor = Math.max(0, (pt.y + 1.12) * 0.46);
                     const breezeX = Math.sin(t * 0.85 + pt.phase) * 0.008 * heightFactor;
 
                     // Smooth bloom unfold interpolation when switching flower modes
                     const unfold = 0.22 + 0.78 * bloomEase;
                     const px0 = (pt.x + breezeX) * unfold;
-                    const py0 = -1.06 + (pt.y + 1.06) * (0.35 + 0.65 * bloomEase);
+                    const py0 = -1.12 + (pt.y + 1.12) * (0.35 + 0.65 * bloomEase);
                     const pz0 = pt.z * unfold;
 
                     // Rotate around Y axis
@@ -934,7 +1140,7 @@
                     const x3 = x2;
 
                     // Perspective projection
-                    const denom = Math.max(0.5, cameraDist - z3);
+                    const denom = Math.max(0.6, cameraDist - z3);
                     const persp = cameraDist / denom;
                     const gx = Math.round(centerX + x3 * scaleX * persp);
                     const gy = Math.round(centerY - y3 * scaleY * persp);
@@ -943,7 +1149,7 @@
 
                     let ch = pt.customChar;
                     if (pt.type === 'stem') {
-                        const slope = x3 / Math.max(0.25, y3 + 1.15);
+                        const slope = x3 / Math.max(0.25, y3 + 1.2);
                         if (slope < -0.38) ch = '\\';
                         else if (slope < -0.14) ch = '`';
                         else if (slope > 0.38) ch = '/';
@@ -966,46 +1172,51 @@
                     }
                 }
 
-                // 3. Render subtle glowing pink ASCII quote at the very bottom
-                renderBottomQuote();
-
-                // 4. Draw dark charcoal-slate vignette background (#2b303a to #1a1e26) and ASCII grid
-                const width = window.innerWidth;
-                const height = window.innerHeight;
-
-                const bgGrad = ctx.createRadialGradient(
-                    width * 0.5, height * 0.48, width * 0.04,
-                    width * 0.5, height * 0.5, Math.max(width, height) * 0.78
-                );
-                bgGrad.addColorStop(0, '#2b303a');
-                bgGrad.addColorStop(0.6, '#212630');
-                bgGrad.addColorStop(1, '#1a1e26');
-                ctx.fillStyle = bgGrad;
-                ctx.fillRect(0, 0, width, height);
+                // 4. Draw cached dark charcoal-slate vignette background and batched ASCII passes
+                ctx.fillStyle = cachedBgGrad || '#181c24';
+                ctx.fillRect(0, 0, viewW, viewH);
 
                 ctx.font = `600 ${cellH}px "Courier New", Consolas, Monaco, monospace`;
                 ctx.textBaseline = 'top';
 
+                // Pass 1: Non-glowing characters (stems, foliage, background dots) with shadowBlur = 0
+                ctx.shadowBlur = 0;
+                let lastColor = '';
                 for (let r = 0; r < rows; r++) {
                     const py = r * cellH;
                     const rowOffset = r * cols;
                     for (let c = 0; c < cols; c++) {
                         const idx = rowOffset + c;
                         const ch = charBuffer[idx];
-                        if (!ch) continue;
+                        if (!ch || glowBuffer[idx]) continue;
 
-                        const px = c * cellW;
                         const col = colorBuffer[idx];
-
-                        if (glowBuffer[idx]) {
-                            ctx.shadowColor = col;
-                            ctx.shadowBlur = 7;
-                        } else {
-                            ctx.shadowBlur = 0;
+                        if (col !== lastColor) {
+                            ctx.fillStyle = col;
+                            lastColor = col;
                         }
+                        ctx.fillText(ch, c * cellW, py);
+                    }
+                }
 
-                        ctx.fillStyle = col;
-                        ctx.fillText(ch, px, py);
+                // Pass 2: Glowing characters (blooms, cores, butterflies, quote)
+                ctx.shadowBlur = cellH < 9 ? 5 : 7;
+                lastColor = '';
+                for (let r = 0; r < rows; r++) {
+                    const py = r * cellH;
+                    const rowOffset = r * cols;
+                    for (let c = 0; c < cols; c++) {
+                        const idx = rowOffset + c;
+                        const ch = charBuffer[idx];
+                        if (!ch || !glowBuffer[idx]) continue;
+
+                        const col = colorBuffer[idx];
+                        if (col !== lastColor) {
+                            ctx.fillStyle = col;
+                            ctx.shadowColor = col;
+                            lastColor = col;
+                        }
+                        ctx.fillText(ch, c * cellW, py);
                     }
                 }
 
@@ -1015,10 +1226,14 @@
 
             // Initialize geometry, listeners, and start animation
             buildBouquetGeometry(FLOWER_MODES[currentModeIndex]);
-            buildAmbientParticles();
             resize();
             window.addEventListener('resize', resize);
-            canvas.addEventListener('pointerdown', cycleFlowerVariety);
+            if (window.visualViewport) {
+                window.visualViewport.addEventListener('resize', resize);
+            }
+            canvas.addEventListener('pointerdown', onPointerDown);
+            canvas.addEventListener('pointerup', onPointerUp);
+            canvas.addEventListener('pointercancel', onPointerCancel);
             requestAnimationFrame(animate);
         })();
     </script>
